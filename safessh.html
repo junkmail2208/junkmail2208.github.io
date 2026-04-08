@@ -10,12 +10,18 @@
     label { display: block; font-size: 0.85rem; margin: 0.5rem 0 0.25rem; color: #333; }
     textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: 0.8rem; min-height: 10rem; }
     .row { display: flex; gap: 0.8rem; align-items: center; margin: 0.75rem 0; }
+    .mini-row { display: flex; gap: 0.45rem; margin-top: 0.4rem; }
     button { padding: 0.4rem 0.85rem; cursor: pointer; }
+    .mini-btn { font-size: 0.75rem; padding: 0.18rem 0.5rem; }
     .err { color: #a00; font-size: 0.85rem; margin-top: 0.35rem; white-space: pre-wrap; }
   </style>
 </head>
 <body>
   <textarea id="txt1" spellcheck="false" placeholder="..."></textarea>
+  <div class="mini-row">
+    <button type="button" id="txt1-clear" class="mini-btn">clear</button>
+    <button type="button" id="txt1-copy" class="mini-btn">copy</button>
+  </div>
 
   <div class="row">
     <button type="button" id="btn1">→</button>
@@ -24,6 +30,10 @@
   </div>
 
   <textarea id="txt3" spellcheck="false" placeholder="..."></textarea>
+  <div class="mini-row">
+    <button type="button" id="txt3-clear" class="mini-btn">clear</button>
+    <button type="button" id="txt3-copy" class="mini-btn">copy</button>
+  </div>
   <div class="err" id="err" hidden></div>
 
   <script>
@@ -139,6 +149,22 @@
     return matches;
   }
 
+  async function copyToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const temp = document.createElement('textarea');
+    temp.value = text;
+    temp.style.position = 'fixed';
+    temp.style.left = '-9999px';
+    document.body.appendChild(temp);
+    temp.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(temp);
+    if (!ok) throw new Error('clipboard copy failed');
+  }
+
   async function encryptFlow(plaintextStr, keyField) {
     const msg = te.encode(plaintextStr);
     if (msg.length > BLOCKSIZE - 2) throw new Error('message UTF-8 length must be <= ' + (BLOCKSIZE - 2));
@@ -204,6 +230,31 @@
   }
 
   const err = document.getElementById('err');
+  const txt1 = document.getElementById('txt1');
+  const txt3 = document.getElementById('txt3');
+
+  document.getElementById('txt1-clear').addEventListener('click', () => { txt1.value = ''; });
+  document.getElementById('txt3-clear').addEventListener('click', () => { txt3.value = ''; });
+  document.getElementById('txt1-copy').addEventListener('click', async () => {
+    err.hidden = true;
+    err.textContent = '';
+    try {
+      await copyToClipboard(txt1.value);
+    } catch (e) {
+      err.textContent = String(e && e.message ? e.message : e);
+      err.hidden = false;
+    }
+  });
+  document.getElementById('txt3-copy').addEventListener('click', async () => {
+    err.hidden = true;
+    err.textContent = '';
+    try {
+      await copyToClipboard(txt3.value);
+    } catch (e) {
+      err.textContent = String(e && e.message ? e.message : e);
+      err.hidden = false;
+    }
+  });
 
   document.getElementById('btn1').addEventListener('click', async () => {
     err.hidden = true;
