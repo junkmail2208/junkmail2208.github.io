@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>encrypt</title>
+</head>
+<body>
+  <div>
+    <textarea id="plain" rows="10" cols="80" spellcheck="false" placeholder="..."></textarea>
+    <br>
+    <button type="button" id="copy-plain">copy</button>
+  </div>
+
+  <p>
+    <button type="button" id="encrypt">&nbsp;→&nbsp;</button>
+    <input id="password" type="password" autocomplete="off" placeholder="..." size="20">
+    <button type="button" id="decrypt">&nbsp;←&nbsp;</button>
+  </p>
+
+  <div>
+    <textarea id="encrypted" rows="10" cols="80" spellcheck="false" placeholder="..."></textarea>
+    <br>
+    <button type="button" id="copy-encrypted">copy</button>
+  </div>
+
+  <p id="err"></p>
+
+  <script>
+  (function () {
+    'use strict';
+
+    const te = new TextEncoder();
+    const td = new TextDecoder('utf-8', { fatal: true });
+    const SALT_LEN = 16;
+    const IV_LEN = 12;
+    const ITER = 100000;
+
+    const plain = document.getElementById('plain');
+    const encrypted = document.getElementById('encrypted');
+    const password = document.getElementById('password');
+    const err = document.getElementById('err');
+
+    function showErr(e) {
+      err.textContent = e && e.message ? e.message : String(e || '');
+    }
+
+    function b64enc(u8) {
+      let s = '';
+      for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+      return btoa(s);
+    }
+
+    function b64dec(str) {
+      const bin = atob(str.replace(/\s+/g, ''));
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) & 255;
+      return out;
+    }
+
+    async function deriveKey(pw, salt) {
+      const base = await crypto.subtle.importKey('raw', te.encode(pw), 'PBKDF2', false, ['deriveKey']);
+      return crypto.subtle.deriveKey(
+        { name: 'PBKDF2', salt: salt, iterations: ITER, hash: 'SHA-256' },
+        base,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+      );
+    }
+
+    async function doEncrypt() {
+      showErr('');
+      const pw = password.value;
+      if (!pw) throw new Error('password is empty');
+      const salt = crypto.getRandomValues(new Uint8Array(SALT_LEN));
+      const iv = crypto.getRandomValues(new Uint8Array(IV_LEN));
+      const key = await deriveKey(pw, salt);
+      const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, te.encode(plain.value)));
+      const out = new Uint8Array(SALT_LEN + IV_LEN + ct.length);
+      out.set(salt, 0);
+      out.set(iv, SALT_LEN);
+      out.set(ct, SALT_LEN + IV_LEN);
+      encrypted.value = b64enc(out);
+    }
+
+    async function doDecrypt() {
+      showErr('');
+      const pw = password.value;
+      if (!pw) throw new Error('password is empty');
+      const raw = b64dec(encrypted.value);
+      if (raw.length < SALT_LEN + IV_LEN + 16) throw new Error('encrypted data too short');
+      const salt = raw.subarray(0, SALT_LEN);
+      const iv = raw.subarray(SALT_LEN, SALT_LEN + IV_LEN);
+      const ct = raw.subarray(SALT_LEN + IV_LEN);
+      const key = await deriveKey(pw, salt);
+      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, ct);
+      plain.value = td.decode(pt);
+    }
+
+    async function copyText(el) {
+      showErr('');
+      await navigator.clipboard.writeText(el.value);
+    }
+
+    document.getElementById('encrypt').onclick = () => doEncrypt().catch(showErr);
+    document.getElementById('decrypt').onclick = () => doDecrypt().catch(showErr);
+    document.getElementById('copy-plain').onclick = () => copyText(plain).catch(showErr);
+    document.getElementById('copy-encrypted').onclick = () => copyText(encrypted).catch(showErr);
+  })();
+  </script>
+</body>
+</html>

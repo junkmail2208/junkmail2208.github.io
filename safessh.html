@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>safe openssh certs</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 54rem; margin: 1rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.05rem; margin-bottom: 0.75rem; }
+    label { display: block; font-size: 0.85rem; margin: 0.5rem 0 0.25rem; color: #333; }
+    textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: 0.8rem; min-height: 10rem; }
+    .row { display: flex; gap: 0.8rem; align-items: center; margin: 0.75rem 0; }
+    .mini-row { display: flex; gap: 0.45rem; margin-top: 0.4rem; }
+    button { padding: 0.4rem 0.85rem; cursor: pointer; }
+    .mini-btn { font-size: 0.75rem; padding: 0.18rem 0.5rem; }
+    .err { color: #a00; font-size: 0.85rem; margin-top: 0.35rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <textarea id="txt1" spellcheck="false" placeholder="..."></textarea>
+  <div class="mini-row">
+    <button type="button" id="txt1-clear" class="mini-btn">clear</button>
+    <button type="button" id="txt1-copy" class="mini-btn">copy</button>
+  </div>
+
+  <div class="row">
+    <button type="button" id="btn1">→</button>
+    <input id="txt2" type="text" autocomplete="off" />
+    <button type="button" id="btn2">←</button>
+  </div>
+
+  <textarea id="txt3" spellcheck="false" placeholder="..."></textarea>
+  <div class="mini-row">
+    <button type="button" id="txt3-clear" class="mini-btn">clear</button>
+    <button type="button" id="txt3-copy" class="mini-btn">copy</button>
+  </div>
+  <div class="err" id="err" hidden></div>
+
+  <script>
+(function () {
+  'use strict';
+
+  const BLOCKSIZE = 116;
+  const NONCE_SIZE = 12;
+
+  const te = new TextEncoder();
+  const td = new TextDecoder('utf-8', { fatal: true });
+
+  function u8(...chunks) {
+    const n = chunks.reduce((s, c) => s + c.length, 0);
+    const out = new Uint8Array(n);
+    let o = 0;
+    for (const c of chunks) { out.set(c, o); o += c.length; }
+    return out;
+  }
+
+  function wU32(n) {
+    return new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+  }
+
+  function wStr(buf) {
+    return u8(wU32(buf.length), buf);
+  }
+
+  function aesKey16(fieldValue) {
+    if (!fieldValue) throw new Error('key must not be empty');
+    const enc = te.encode(fieldValue);
+    const k = new Uint8Array(16);
+    k.set(enc.subarray(0, Math.min(16, enc.length)));
+    return k;
+  }
+
+  function randomBytes(n) {
+    const b = new Uint8Array(n);
+    crypto.getRandomValues(b);
+    return b;
+  }
+
+  class Reader {
+    constructor(buf) {
+      this.u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+      this.o = 0;
+    }
+    read(n) {
+      if (this.o + n > this.u8.length) throw new Error('unexpected EOF');
+      const s = this.u8.subarray(this.o, this.o + n);
+      this.o += n;
+      return s;
+    }
+    u32be() {
+      const v = new DataView(this.u8.buffer, this.u8.byteOffset + this.o, 4);
+      const r = v.getUint32(0, false);
+      this.o += 4;
+      return r;
+    }
+    readString() {
+      const n = this.u32be();
+      return this.read(n);
+    }
+  }
+
+  async function importAesGcmKey(raw16) {
+    return crypto.subtle.importKey('raw', raw16, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  }
+
+  function pemFromPayload(payloadU8) {
+    let b64 = '';
+    const bin = payloadU8;
+    for (let i = 0; i < bin.length; i++) b64 += String.fromCharCode(bin[i]);
+    b64 = btoa(b64);
+    const lines = [];
+    for (let i = 0; i < b64.length; i += 70) lines.push(b64.slice(i, i + 70));
+    return '-----BEGIN OPENSSH PRIVATE KEY-----\n' + lines.join('\n') + '\n-----END OPENSSH PRIVATE KEY-----';
+  }
+
+  function parsePem(pemText) {
+    const lines = pemText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const body = lines.filter((l) => !l.startsWith('-----')).join('');
+    const bin = atob(body);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) & 255;
+    return out;
+  }
+
+  function splitUtf8Chunks(str, maxBytes) {
+    const chunks = [];
+    let cur = '';
+    let curLen = 0;
+    for (const ch of str) {
+      const bLen = te.encode(ch).length;
+      if (bLen > maxBytes) throw new Error('single character exceeds max chunk size');
+      if (curLen + bLen > maxBytes) {
+        chunks.push(cur);
+        cur = ch;
+        curLen = bLen;
+      } else {
+        cur += ch;
+        curLen += bLen;
+      }
+    }
+    if (curLen > 0 || str.length === 0) chunks.push(cur);
+    return chunks;
+  }
+
+  function extractPemBlocks(text) {
+    const re = /-----BEGIN OPENSSH PRIVATE KEY-----[\s\S]*?-----END OPENSSH PRIVATE KEY-----/g;
+    const matches = text.match(re);
+    if (!matches || matches.length === 0) throw new Error('no PEM block found');
+    return matches;
+  }
+
+  async function copyToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const temp = document.createElement('textarea');
+    temp.value = text;
+    temp.style.position = 'fixed';
+    temp.style.left = '-9999px';
+    document.body.appendChild(temp);
+    temp.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(temp);
+    if (!ok) throw new Error('clipboard copy failed');
+  }
+
+  async function encryptFlow(plaintextStr, keyField) {
+    const msg = te.encode(plaintextStr);
+    if (msg.length > BLOCKSIZE - 2) throw new Error('message UTF-8 length must be <= ' + (BLOCKSIZE - 2));
+
+    const plain = u8(new Uint8Array([(msg.length >>> 8) & 255, msg.length & 255]), msg);
+    const plainex = new Uint8Array(BLOCKSIZE);
+    plainex.set(plain);
+    crypto.getRandomValues(plainex.subarray(plain.length));
+
+    const nonce = randomBytes(NONCE_SIZE);
+    const keyRaw = aesKey16(keyField);
+    const cryptoKey = await importAesGcmKey(keyRaw);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce, tagLength: 128 }, cryptoKey, plainex));
+    const out = u8(nonce, ct);
+
+    const pubkey_ed25519 = randomBytes(32);
+    const pub_inner = u8(wU32(11), te.encode('ssh-ed25519'), wU32(32), pubkey_ed25519);
+
+    const fake_salt = randomBytes(16);
+    const fake_rounds = 24;
+    const fake_kdfopts = u8(wU32(fake_salt.length), fake_salt, wU32(fake_rounds));
+
+    const magic = u8(te.encode('openssh-key-v1'), new Uint8Array([0]));
+    const raw = u8(
+      magic,
+      wStr(te.encode('aes256-ctr')),
+      wStr(te.encode('bcrypt')),
+      wStr(fake_kdfopts),
+      wU32(1),
+      wStr(pub_inner),
+      wStr(out),
+    );
+
+    return pemFromPayload(raw);
+  }
+
+  async function decryptFlow(pemText, keyField) {
+    const data = parsePem(pemText);
+    const bio = new Reader(data);
+    const magLen = te.encode('openssh-key-v1').length + 1;
+    const magic = bio.read(magLen);
+    const magExpect = u8(te.encode('openssh-key-v1'), new Uint8Array([0]));
+    if (magic.length !== magExpect.length || !magic.every((b, i) => b === magExpect[i])) throw new Error('bad magic');
+
+    bio.readString(); /* ciphername */
+    bio.readString(); /* kdfname */
+    bio.readString(); /* kdfopts */
+    bio.u32be(); /* nkeys */
+    bio.readString(); /* pubkey_blob */
+    const enc_blob = bio.readString();
+
+    if (enc_blob.length < NONCE_SIZE + 16) throw new Error('enc_blob too short');
+    const nonce = enc_blob.subarray(0, NONCE_SIZE);
+    const ciphertext = enc_blob.subarray(NONCE_SIZE);
+
+    const keyRaw = aesKey16(keyField);
+    const cryptoKey = await importAesGcmKey(keyRaw);
+    const plainex = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce, tagLength: 128 }, cryptoKey, ciphertext));
+
+    const inner_len = (plainex[0] << 8) | plainex[1];
+    if (2 + inner_len > plainex.length) throw new Error('bad inner length');
+    return td.decode(plainex.subarray(2, 2 + inner_len));
+  }
+
+  const err = document.getElementById('err');
+  const txt1 = document.getElementById('txt1');
+  const txt3 = document.getElementById('txt3');
+
+  document.getElementById('txt1-clear').addEventListener('click', () => { txt1.value = ''; });
+  document.getElementById('txt3-clear').addEventListener('click', () => { txt3.value = ''; });
+  document.getElementById('txt1-copy').addEventListener('click', async () => {
+    err.hidden = true;
+    err.textContent = '';
+    try {
+      await copyToClipboard(txt1.value);
+    } catch (e) {
+      err.textContent = String(e && e.message ? e.message : e);
+      err.hidden = false;
+    }
+  });
+  document.getElementById('txt3-copy').addEventListener('click', async () => {
+    err.hidden = true;
+    err.textContent = '';
+    try {
+      await copyToClipboard(txt3.value);
+    } catch (e) {
+      err.textContent = String(e && e.message ? e.message : e);
+      err.hidden = false;
+    }
+  });
+
+  document.getElementById('btn1').addEventListener('click', async () => {
+    err.hidden = true;
+    err.textContent = '';
+    try {
+      const text = document.getElementById('txt1').value;
+      const chunks = splitUtf8Chunks(text, BLOCKSIZE - 2);
+      const blocks = [];
+      for (const chunk of chunks) blocks.push(await encryptFlow(chunk, document.getElementById('txt2').value));
+      document.getElementById('txt3').value = blocks.join('\n');
+    } catch (e) {
+      err.textContent = String(e && e.message ? e.message : e);
+      err.hidden = false;
+    }
+  });
+
+  document.getElementById('btn2').addEventListener('click', async () => {
+    err.hidden = true;
+    err.textContent = '';
+    try {
+      const pems = extractPemBlocks(document.getElementById('txt3').value);
+      const parts = [];
+      for (const pem of pems) parts.push(await decryptFlow(pem, document.getElementById('txt2').value));
+      document.getElementById('txt1').value = parts.join('');
+    } catch (e) {
+      err.textContent = String(e && e.message ? e.message : e);
+      err.hidden = false;
+    }
+  });
+})();
+  </script>
+</body>
+</html>
